@@ -20,6 +20,16 @@ Stemmer::~Stemmer() {
 std::string Stemmer::stem(const std::string & word) {
     std::unique_lock<std::mutex> lock(mutex);
     std::string stemmed_word;
+
+    if(!dictionary_name.empty()) {
+        // cached results may predate a dictionary update
+        const uint64_t current_version = StemmerManager::get_instance().get_dictionary_version();
+        if(current_version != dictionary_version) {
+            cache.clear();
+            dictionary_version = current_version;
+        }
+    }
+
     if (cache.contains(word)) {
         return cache.lookup(word);
     }
@@ -40,6 +50,17 @@ std::string Stemmer::stem(const std::string & word) {
     return stemmed_word;
 }
 
+namespace {
+    // Bumps the dictionary version when it goes out of scope. Declare it after the lock guard so the bump
+    // happens after the dictionary change and before the lock is released, on every return path.
+    struct DictionaryVersionBump {
+        std::atomic<uint64_t>& version;
+        ~DictionaryVersionBump() {
+            version.fetch_add(1, std::memory_order_release);
+        }
+    };
+}
+
 void StemmerManager::init(Store* _store) {
     store = _store;
 }
@@ -51,6 +72,8 @@ StemmerManager::~StemmerManager() {
 
 void StemmerManager::dispose() {
     delete_all_stemmers();
+    std::lock_guard<std::mutex> lock(mutex);
+    DictionaryVersionBump version_bump{dictionary_version};
     stem_dictionaries.clear();
 }
 
@@ -120,6 +143,7 @@ Option<bool> StemmerManager::upsert_stemming_dictionary(const std::string& dicti
     }
 
     std::lock_guard<std::mutex> lock(mutex);
+    DictionaryVersionBump version_bump{dictionary_version};
 
     nlohmann::json json_line;
     
@@ -224,6 +248,7 @@ Option<bool> StemmerManager::del_stemming_dictionary(const std::string &id) {
 
     auto found = stem_dictionaries.find(id);
     if(found != stem_dictionaries.end()) {
+        DictionaryVersionBump version_bump{dictionary_version};
         stem_dictionaries.erase(found);
 
         bool removed = store->remove(get_stemming_dictionary_key(id));
@@ -237,6 +262,7 @@ Option<bool> StemmerManager::del_stemming_dictionary(const std::string &id) {
 
 void StemmerManager::delete_all_stemming_dictionaries() {
     std::lock_guard<std::mutex> lock(mutex);
+    DictionaryVersionBump version_bump{dictionary_version};
     for(const auto& kv : stem_dictionaries) {
         store->remove(get_stemming_dictionary_key(kv.first));
     }
